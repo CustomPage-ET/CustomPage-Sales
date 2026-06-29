@@ -1,7 +1,9 @@
 package custompage.sales.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import custompage.sales.dto.DetalleOrdenDTO;
 import custompage.sales.dto.OrdenDTO;
+import custompage.sales.dto.VentaRealizadaEventDTO;
 import custompage.sales.exception.ResourceNotFoundException;
 import custompage.sales.model.DetalleOrden;
 import custompage.sales.model.Orden;
@@ -23,11 +25,16 @@ public class OrdenServiceImpl implements IOrdenService {
     private final OrdenRepository ordenRepository;
     private final VentaRepository ventaRepository;
     private final KafkaTemplate<String, String> kafkaTemplate;
+    private final ObjectMapper objectMapper; // 👈 Agregado para convertir el DTO a JSON String real
 
-    public OrdenServiceImpl(OrdenRepository ordenRepository, VentaRepository ventaRepository, KafkaTemplate<String, String> kafkaTemplate) {
+    public OrdenServiceImpl(OrdenRepository ordenRepository,
+                            VentaRepository ventaRepository,
+                            KafkaTemplate<String, String> kafkaTemplate,
+                            ObjectMapper objectMapper) { // 👈 Inyectado en el constructor
         this.ordenRepository = ordenRepository;
         this.ventaRepository = ventaRepository;
         this.kafkaTemplate = kafkaTemplate;
+        this.objectMapper = objectMapper;
     }
 
     @Override
@@ -75,13 +82,30 @@ public class OrdenServiceImpl implements IOrdenService {
                 .totalCobrado(orden.getTotal())
                 .metodoPago(metodoPago)
                 .build();
-        ventaRepository.save(venta);
+        Venta ventaGuardada = ventaRepository.save(venta);
 
-        // 3. Notificar asíncronamente a través de Kafka al microservicio de productos
-        orden.getDetalles().forEach(detalle -> {
-            String mensajeKafka = detalle.getCodigoSKU() + ":" + detalle.getCantidad();
-            kafkaTemplate.send("venta-realizada-topic", mensajeKafka);
-        });
+        // 3. Notificar asíncronamente a través de Kafka al microservicio de Marketing (Mensaje JSON único)
+        // Construimos el DTO estructurado con los datos reales necesarios para analítica y cupones
+        VentaRealizadaEventDTO eventoMarketing = VentaRealizadaEventDTO.builder()
+                .idVenta(ventaGuardada.getIdVenta())
+                .numeroOrden("ORD-" + orden.getIdOrden()) // Generación de código de orden
+                .idCliente(orden.getIdEmpresa()) // Usamos el ID ligado a la cuenta/empresa compradora
+                .total(ventaGuardada.getTotalCobrado())
+                .fechaVenta(ventaGuardada.getFechaTransaccion().toString())
+                .build();
+
+        try {
+            // Convertimos el objeto de evento a un String JSON real
+            String jsonMensaje = objectMapper.writeValueAsString(eventoMarketing);
+
+            // Enviamos el JSON al tópico que escucha el microservicio de marketing
+            kafkaTemplate.send("venta-realizada-topic", jsonMensaje);
+
+            System.out.println("Mensaje JSON enviado con éxito a Kafka para Marketing: " + jsonMensaje);
+        } catch (Exception e) {
+            // Manejo de error de serialización local para no romper el flujo de la transacción de pago
+            System.err.println("Error al serializar el evento de ventas para Kafka: " + e.getMessage());
+        }
 
         return convertToDTO(orden);
     }
